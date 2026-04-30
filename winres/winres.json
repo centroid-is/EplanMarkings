@@ -1,0 +1,29 @@
+{
+  "RT_GROUP_ICON": {
+    "#1": {
+      "0000": [
+        "icon256.png",
+        "icon128.png",
+        "icon64.png",
+        "icon48.png",
+        "icon32.png",
+        "icon24.png",
+        "icon16.png"
+      ]
+    }
+  },
+  "RT_MANIFEST": {
+    "#1": {
+      "0409": {
+        "identity": {
+          "name": "PrintWireLabels",
+          "version": "1.0.0.0"
+        },
+        "description": "PrintWireLabels",
+        "minimum-os": "win7",
+        "execution-level": "as invoker",
+        "dpi-awareness": "system"
+      }
+    }
+  }
+}

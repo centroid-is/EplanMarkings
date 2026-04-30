@@ -1,0 +1,5 @@
+*.exe
+*.syso
+~$*
+*.ico
+/winres/icon*.png

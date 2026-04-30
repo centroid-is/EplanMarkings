@@ -1,0 +1,117 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            cgo_enabled: 0
+            binary: EplanMarkings_windows_amd64.exe
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            cgo_enabled: 1
+            binary: EplanMarkings_linux_amd64
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            cgo_enabled: 1
+            binary: EplanMarkings_darwin_arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Gio dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-x11-dev \
+            libgles2-mesa-dev \
+            libegl1-mesa-dev \
+            libffi-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxxf86vm-dev \
+            pkg-config
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+        run: |
+          go install github.com/tc-hib/go-winres@latest
+          go-winres make
+          go build -buildvcs=false -o ${{ matrix.binary }} .
+
+      - name: Build (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+        run: |
+          go build -buildvcs=false -o ${{ matrix.binary }} .
+
+      - name: Build (macOS)
+        if: matrix.os == 'macos-latest'
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo_enabled }}
+        run: |
+          go build -buildvcs=false -o ${{ matrix.binary }} .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: ${{ matrix.binary }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" \
+            --title "$tag" \
+            --generate-notes \
+            artifacts/EplanMarkings_windows_amd64.exe/EplanMarkings_windows_amd64.exe \
+            artifacts/EplanMarkings_linux_amd64/EplanMarkings_linux_amd64 \
+            artifacts/EplanMarkings_darwin_arm64/EplanMarkings_darwin_arm64
