@@ -14,28 +14,27 @@ import (
 // envelope, over a raw TCP socket. This mirrors what M-Print PRO emits: the
 // label text is rasterised on the PC side (so the font is whatever we render,
 // e.g. Tahoma) and downloaded as a bitmap, rather than sent as font commands.
-func executePrint(labels []parser.WireLabel, cfg PrintConfig) {
+//
+// It returns the number of labels successfully sent and the first error, if any.
+func executePrint(labels []parser.WireLabel, cfg PrintConfig) (int, error) {
 	addr := net.JoinHostPort(cfg.PrinterHost, cfg.Port)
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		fmt.Printf("print: cannot connect to %s: %v\n", addr, err)
-		return
+		return 0, fmt.Errorf("cannot connect to %s: %w", addr, err)
 	}
 	defer conn.Close()
 
 	roll := rollByIndex(cfg.RollIndex)
-	for _, l := range labels {
+	for i, l := range labels {
 		_, png, err := renderLabel(l.TerminalSide, l.ComponentSide, roll, cfg)
 		if err != nil {
-			fmt.Printf("print: render %q failed: %v\n", l.TerminalSide+" "+l.ComponentSide, err)
-			return
+			return i, fmt.Errorf("rendering %q: %w", l.TerminalSide+" "+l.ComponentSide, err)
 		}
 		if _, err := conn.Write(wrapCabJob(png, roll, cfg.Copies)); err != nil {
-			fmt.Printf("print: send to %s failed: %v\n", addr, err)
-			return
+			return i, fmt.Errorf("sending to %s: %w", addr, err)
 		}
 	}
-	fmt.Printf("print: sent %d label(s) to %s\n", len(labels), addr)
+	return len(labels), nil
 }
 
 // wrapCabJob frames a rendered PNG in the cab JScript download/print sequence

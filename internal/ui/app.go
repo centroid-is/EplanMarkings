@@ -5,6 +5,7 @@ import (
 	"image"
 	"image/color"
 	"sort"
+	"sync"
 
 	"gioui.org/app"
 	"gioui.org/layout"
@@ -59,6 +60,38 @@ type appState struct {
 	cfgSaveBtn   widget.Clickable
 	cfgCancelBtn widget.Clickable
 	cfgList      widget.List
+
+	// Print status (written by the print goroutine, read in the frame loop)
+	win         *app.Window
+	mu          sync.Mutex
+	printStatus string
+	printLevel  statusLevel
+}
+
+type statusLevel int
+
+const (
+	statusNone statusLevel = iota
+	statusInfo
+	statusSuccess
+	statusError
+)
+
+func (s *appState) setPrintStatus(level statusLevel, msg string) {
+	s.mu.Lock()
+	s.printLevel = level
+	s.printStatus = msg
+	w := s.win
+	s.mu.Unlock()
+	if w != nil {
+		w.Invalidate()
+	}
+}
+
+func (s *appState) getPrintStatus() (statusLevel, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.printLevel, s.printStatus
 }
 
 // PrintConfig holds network printer settings for the THM MultiMark (cab
@@ -144,6 +177,9 @@ func Run(excelPath string) {
 	go func() {
 		w := new(app.Window)
 		w.Option(app.Title("PrintWireLabels"), app.Size(unit.Dp(1000), unit.Dp(600)))
+		state.mu.Lock()
+		state.win = w
+		state.mu.Unlock()
 		th := SolarizedDarkTheme()
 
 		var ops op.Ops
@@ -371,6 +407,10 @@ func layoutLabelTable(gtx layout.Context, th *material.Theme, state *appState) l
 					}),
 				)
 			})
+		}),
+		// Print status line
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layoutPrintStatus(gtx, th, state)
 		}),
 		// Roll selector
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
@@ -637,6 +677,27 @@ func (s *appState) updatePreview() {
 	s.previewValid = true
 }
 
+func layoutPrintStatus(gtx layout.Context, th *material.Theme, state *appState) layout.Dimensions {
+	level, msg := state.getPrintStatus()
+	if msg == "" {
+		return layout.Dimensions{}
+	}
+	col := ColorMuted()
+	switch level {
+	case statusSuccess:
+		col = ColorSuccess()
+	case statusError:
+		col = ColorError()
+	case statusInfo:
+		col = ColorAccent()
+	}
+	return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(2), Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		lbl := material.Body2(th, msg)
+		lbl.Color = col
+		return lbl.Layout(gtx)
+	})
+}
+
 func layoutRollBar(gtx layout.Context, th *material.Theme, state *appState) layout.Dimensions {
 	return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 		children := []layout.FlexChild{
@@ -747,7 +808,20 @@ func printSelected(state *appState) {
 		}
 	}
 	if len(selected) == 0 {
+		state.setPrintStatus(statusInfo, "No labels selected")
 		return
 	}
-	go executePrint(selected, state.printConfig)
+
+	cfg := state.printConfig
+	roll := rollByIndex(cfg.RollIndex)
+	state.setPrintStatus(statusInfo, fmt.Sprintf("Printing %d label(s) to %s…", len(selected), cfg.PrinterHost))
+
+	go func() {
+		n, err := executePrint(selected, cfg)
+		if err != nil {
+			state.setPrintStatus(statusError, fmt.Sprintf("Print failed after %d/%d: %v", n, len(selected), err))
+			return
+		}
+		state.setPrintStatus(statusSuccess, fmt.Sprintf("Sent %d label(s) to %s (%s)", n, cfg.PrinterHost, roll.Name))
+	}()
 }
