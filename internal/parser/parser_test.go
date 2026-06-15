@@ -203,15 +203,15 @@ func TestParseFile(t *testing.T) {
 		t.Error("expected labels for +U1 in X13, got none")
 	}
 
-	// Verify a known label exists: -X13:3 / -K4:A:10
+	// Verify a known label exists: -X13:3 / -K5:A:10
 	found := false
 	for _, l := range labels {
-		if l.TerminalSide == "-X13:3" && l.ComponentSide == "-K4:A:10" {
+		if l.TerminalSide == "-X13:3" && l.ComponentSide == "-K5:A:10" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("expected label -X13:3 / -K4:A:10 in results, labels: %+v", labels)
+		t.Errorf("expected label -X13:3 / -K5:A:10 in results, labels: %+v", labels)
 	}
 }
