@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"image"
 	"image/color"
 	"sort"
@@ -45,6 +46,13 @@ type appState struct {
 	configBtn   widget.Clickable
 	showConfig  bool
 	printConfig PrintConfig
+	rollClicks  []widget.Clickable
+
+	// Label preview (cached; rebuilt when inputs change)
+	previewOp    paint.ImageOp
+	previewKey   string
+	previewErr   error
+	previewValid bool
 
 	// Config sidebar
 	cfgFields    []configFieldInfo
@@ -53,38 +61,48 @@ type appState struct {
 	cfgList      widget.List
 }
 
-// PrintConfig holds Brother P-touch CLI arguments.
+// PrintConfig holds network printer settings for the THM MultiMark (cab
+// JScript over a raw TCP socket).
 type PrintConfig struct {
-	PtouchCmd string
-	TapeWidth string
-	FontSize  string
-	Copies    string
+	PrinterHost string // printer IP/hostname, e.g. "10.50.10.198"
+	Port        string // JScript raw socket port, default "9100"
+	FontName    string // label font, e.g. "Tahoma"
+	FontSize    string // font height in points for label text
+	Copies      string // copies printed per selected label
+	RollIndex   int    // selected MarkerRolls entry (loaded marker material)
 }
 
 func defaultPrintConfig() PrintConfig {
 	return PrintConfig{
-		PtouchCmd: "ptouch-print",
-		TapeWidth: "12",
-		FontSize:  "12",
-		Copies:    "1",
+		PrinterHost: "10.50.10.198",
+		Port:        "9100",
+		FontName:    "Tahoma",
+		FontSize:    "10",
+		Copies:      "1",
+		RollIndex:   0,
 	}
 }
 
 func (s *appState) initConfigFields() {
 	s.cfgFields = []configFieldInfo{
 		{
-			label:  "Command",
-			help:   "Path or name of the ptouch-print CLI executable. Install from github.com/philpem/printer-driver-ptouch",
+			label:  "Printer IP",
+			help:   "IP address or hostname of the THM MultiMark printer on the network (e.g. 10.50.10.198)",
 			editor: &widget.Editor{SingleLine: true},
 		},
 		{
-			label:  "Tape Width (mm)",
-			help:   "Width of the label tape in millimeters. Common sizes: 6, 9, 12, 18, 24, 36",
+			label:  "Port",
+			help:   "Raw TCP socket port for the printer. Default is 9100",
 			editor: &widget.Editor{SingleLine: true},
 		},
 		{
-			label:  "Font Size",
-			help:   "Font size in points for label text. Adjust based on tape width for readability",
+			label:  "Font",
+			help:   "Font family for label text, e.g. Tahoma. Must be installed in the OS font folder",
+			editor: &widget.Editor{SingleLine: true},
+		},
+		{
+			label:  "Font Size (pt)",
+			help:   "Font size in points for label text. Rendered at 300 dpi to match M-Print PRO",
 			editor: &widget.Editor{SingleLine: true},
 		},
 		{
@@ -93,10 +111,11 @@ func (s *appState) initConfigFields() {
 			editor: &widget.Editor{SingleLine: true},
 		},
 	}
-	s.cfgFields[0].editor.SetText(s.printConfig.PtouchCmd)
-	s.cfgFields[1].editor.SetText(s.printConfig.TapeWidth)
-	s.cfgFields[2].editor.SetText(s.printConfig.FontSize)
-	s.cfgFields[3].editor.SetText(s.printConfig.Copies)
+	s.cfgFields[0].editor.SetText(s.printConfig.PrinterHost)
+	s.cfgFields[1].editor.SetText(s.printConfig.Port)
+	s.cfgFields[2].editor.SetText(s.printConfig.FontName)
+	s.cfgFields[3].editor.SetText(s.printConfig.FontSize)
+	s.cfgFields[4].editor.SetText(s.printConfig.Copies)
 	s.cfgList.List.Axis = layout.Vertical
 }
 
@@ -115,6 +134,7 @@ func Run(excelPath string) {
 		selectedSheet:  -1,
 		selectedLocIdx: -1,
 		sheetClicks:    make([]widget.Clickable, len(sheets)),
+		rollClicks:     make([]widget.Clickable, len(MarkerRolls)),
 		printConfig:    defaultPrintConfig(),
 	}
 	state.sheetList.List.Axis = layout.Vertical
@@ -181,6 +201,16 @@ func layoutApp(gtx layout.Context, th *material.Theme, state *appState) layout.D
 			state.labelChecks[i].Value = state.selectAll.Value
 		}
 	}
+
+	// Handle roll selection
+	for i := range state.rollClicks {
+		if state.rollClicks[i].Clicked(gtx) {
+			state.printConfig.RollIndex = i
+		}
+	}
+
+	// Refresh the cached label preview if any input changed
+	state.updatePreview()
 
 	// Handle print button
 	if state.printBtn.Clicked(gtx) {
@@ -342,6 +372,15 @@ func layoutLabelTable(gtx layout.Context, th *material.Theme, state *appState) l
 				)
 			})
 		}),
+		// Roll selector
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layoutRollBar(gtx, th, state)
+		}),
+		// Label preview
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layoutPreview(gtx, th, state)
+		}),
+		layout.Rigid(horzSeparator),
 		// Column headers with select all
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
 			return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(4)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
@@ -408,10 +447,11 @@ func layoutConfigSidebar(gtx layout.Context, th *material.Theme, state *appState
 
 	// Handle save
 	if state.cfgSaveBtn.Clicked(gtx) {
-		state.printConfig.PtouchCmd = state.cfgFields[0].editor.Text()
-		state.printConfig.TapeWidth = state.cfgFields[1].editor.Text()
-		state.printConfig.FontSize = state.cfgFields[2].editor.Text()
-		state.printConfig.Copies = state.cfgFields[3].editor.Text()
+		state.printConfig.PrinterHost = state.cfgFields[0].editor.Text()
+		state.printConfig.Port = state.cfgFields[1].editor.Text()
+		state.printConfig.FontName = state.cfgFields[2].editor.Text()
+		state.printConfig.FontSize = state.cfgFields[3].editor.Text()
+		state.printConfig.Copies = state.cfgFields[4].editor.Text()
 		state.showConfig = false
 		return
 	}
@@ -454,7 +494,7 @@ func layoutConfigSidebar(gtx layout.Context, th *material.Theme, state *appState
 		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 			// Title
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				lbl := material.H6(th, "P-touch Config")
+				lbl := material.H6(th, "Printer Config")
 				lbl.Color = ColorHeader()
 				return lbl.Layout(gtx)
 			}),
@@ -462,19 +502,17 @@ func layoutConfigSidebar(gtx layout.Context, th *material.Theme, state *appState
 
 			// Config fields
 			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutConfigField(gtx, th, &state.cfgFields[0])
-			}),
-			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutConfigField(gtx, th, &state.cfgFields[1])
-			}),
-			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutConfigField(gtx, th, &state.cfgFields[2])
-			}),
-			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
-			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-				return layoutConfigField(gtx, th, &state.cfgFields[3])
+				children := make([]layout.FlexChild, 0, len(state.cfgFields)*2)
+				for i := range state.cfgFields {
+					field := &state.cfgFields[i]
+					children = append(children,
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return layoutConfigField(gtx, th, field)
+						}),
+						layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+					)
+				}
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
 			}),
 
 			layout.Rigid(layout.Spacer{Height: unit.Dp(20)}.Layout),
@@ -560,6 +598,145 @@ func layoutConfigField(gtx layout.Context, th *material.Theme, field *configFiel
 			})
 		}),
 	)
+}
+
+// previewSample picks the label to show in the preview: the first checked
+// label, else the first label, else a placeholder.
+func previewSample(s *appState) (string, string) {
+	for i := range s.labelChecks {
+		if i < len(s.labels) && s.labelChecks[i].Value {
+			return s.labels[i].TerminalSide, s.labels[i].ComponentSide
+		}
+	}
+	if len(s.labels) > 0 {
+		return s.labels[0].TerminalSide, s.labels[0].ComponentSide
+	}
+	return "-X1:1", "-K1:A:1"
+}
+
+// updatePreview re-renders the cached preview image when the roll, font, or
+// sample label changes.
+func (s *appState) updatePreview() {
+	term, comp := previewSample(s)
+	roll := rollByIndex(s.printConfig.RollIndex)
+	key := fmt.Sprintf("%d|%s|%s|%s|%s", s.printConfig.RollIndex,
+		s.printConfig.FontName, s.printConfig.FontSize, term, comp)
+	if key == s.previewKey {
+		return
+	}
+	s.previewKey = key
+
+	img, _, err := renderLabel(term, comp, roll, s.printConfig)
+	if err != nil {
+		s.previewErr = err
+		s.previewValid = false
+		return
+	}
+	s.previewErr = nil
+	s.previewOp = paint.NewImageOp(img)
+	s.previewValid = true
+}
+
+func layoutRollBar(gtx layout.Context, th *material.Theme, state *appState) layout.Dimensions {
+	return layout.Inset{Top: unit.Dp(4), Bottom: unit.Dp(4), Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		children := []layout.FlexChild{
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Body2(th, "Roll:")
+				lbl.Color = ColorMuted()
+				return layout.Inset{Right: unit.Dp(8), Top: unit.Dp(6)}.Layout(gtx, lbl.Layout)
+			}),
+		}
+		for i := range MarkerRolls {
+			i := i
+			children = append(children,
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layoutRollChip(gtx, th, &state.rollClicks[i], MarkerRolls[i], i == state.printConfig.RollIndex)
+				}),
+				layout.Rigid(layout.Spacer{Width: unit.Dp(6)}.Layout),
+			)
+		}
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx, children...)
+	})
+}
+
+func layoutRollChip(gtx layout.Context, th *material.Theme, click *widget.Clickable, roll MarkerRoll, selected bool) layout.Dimensions {
+	return material.Clickable(gtx, click, func(gtx layout.Context) layout.Dimensions {
+		macro := op.Record(gtx.Ops)
+		dims := layout.Inset{Top: unit.Dp(6), Bottom: unit.Dp(6), Left: unit.Dp(10), Right: unit.Dp(10)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			lbl := material.Body2(th, roll.Name)
+			if selected {
+				lbl.Color = th.Palette.ContrastFg
+			} else {
+				lbl.Color = th.Palette.Fg
+			}
+			return lbl.Layout(gtx)
+		})
+		call := macro.Stop()
+
+		bg := ColorSurface()
+		if selected {
+			bg = ColorAccent()
+		}
+		rect := clip.UniformRRect(image.Rect(0, 0, dims.Size.X, dims.Size.Y), gtx.Dp(unit.Dp(4))).Push(gtx.Ops)
+		paint.ColorOp{Color: bg}.Add(gtx.Ops)
+		paint.PaintOp{}.Add(gtx.Ops)
+		rect.Pop()
+
+		call.Add(gtx.Ops)
+		return dims
+	})
+}
+
+func layoutPreview(gtx layout.Context, th *material.Theme, state *appState) layout.Dimensions {
+	roll := rollByIndex(state.printConfig.RollIndex)
+	caption := fmt.Sprintf("Preview — %s, %s %spt", roll.Label(), state.printConfig.FontName, state.printConfig.FontSize)
+
+	return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(6), Left: unit.Dp(12), Right: unit.Dp(12)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Caption(th, caption)
+				lbl.Color = ColorMuted()
+				return lbl.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Height: unit.Dp(4)}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if !state.previewValid {
+					msg := "preview unavailable"
+					if state.previewErr != nil {
+						msg = "preview: " + state.previewErr.Error()
+					}
+					lbl := material.Caption(th, msg)
+					lbl.Color = ColorError()
+					return lbl.Layout(gtx)
+				}
+				return layoutPreviewImage(gtx, roll, state.previewOp)
+			}),
+		)
+	})
+}
+
+func layoutPreviewImage(gtx layout.Context, roll MarkerRoll, img paint.ImageOp) layout.Dimensions {
+	h := gtx.Dp(unit.Dp(52))
+	aspect := 1.0
+	if roll.HeightMM > 0 {
+		aspect = roll.WidthMM / roll.HeightMM
+	}
+	w := int(float64(h) * aspect)
+	if max := gtx.Constraints.Max.X; w > max && max > 0 {
+		w = max
+		h = int(float64(w) / aspect)
+	}
+
+	// White marker background
+	rect := clip.Rect{Max: image.Pt(w, h)}.Push(gtx.Ops)
+	paint.ColorOp{Color: color.NRGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff}}.Add(gtx.Ops)
+	paint.PaintOp{}.Add(gtx.Ops)
+	rect.Pop()
+
+	igtx := gtx
+	igtx.Constraints = layout.Exact(image.Pt(w, h))
+	widget.Image{Src: img, Fit: widget.Contain, Position: layout.Center}.Layout(igtx)
+	return layout.Dimensions{Size: image.Pt(w, h)}
 }
 
 func printSelected(state *appState) {

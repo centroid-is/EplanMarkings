@@ -19,7 +19,7 @@ Pre-built binaries are available from the latest release:
 - Excel terminal strip parsing
 - Location-based filtering
 - Wire label generation
-- Brother P-touch print integration
+- Weidmüller THM MultiMark network printing (cab JScript over TCP)
 
 ## Build from Source
 
