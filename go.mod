@@ -3,14 +3,17 @@ module github.com/centroid-is/print-wire-labels
 go 1.24.2
 
 require (
-	gioui.org v0.9.0
+	gioui.org v0.10.0
+	gioui.org/x v0.10.0
 	github.com/xuri/excelize/v2 v2.10.1
 	golang.org/x/image v0.26.0
 )
 
 require (
 	gioui.org/shader v1.0.8 // indirect
-	github.com/go-text/typesetting v0.3.0 // indirect
+	git.wow.st/gmp/jni v0.0.0-20210610011705-34026c7e22d0 // indirect
+	github.com/go-text/typesetting v0.3.4 // indirect
+	github.com/godbus/dbus/v5 v5.0.6 // indirect
 	github.com/richardlehane/mscfb v1.0.6 // indirect
 	github.com/richardlehane/msoleps v1.0.6 // indirect
 	github.com/tiendc/go-deepcopy v1.7.2 // indirect

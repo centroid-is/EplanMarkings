@@ -1,9 +1,11 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
+	"path/filepath"
 	"sort"
 	"sync"
 
@@ -15,6 +17,7 @@ import (
 	"gioui.org/unit"
 	"gioui.org/widget"
 	"gioui.org/widget/material"
+	"gioui.org/x/explorer"
 
 	"github.com/centroid-is/print-wire-labels/internal/parser"
 )
@@ -61,11 +64,81 @@ type appState struct {
 	cfgCancelBtn widget.Clickable
 	cfgList      widget.List
 
+	// File loading
+	openBtn     widget.Clickable
+	currentFile string
+	expl        *explorer.Explorer
+
 	// Print status (written by the print goroutine, read in the frame loop)
 	win         *app.Window
 	mu          sync.Mutex
 	printStatus string
 	printLevel  statusLevel
+
+	// Pending file load + load banner (mu-guarded; applied in the frame loop)
+	pendingReady  bool
+	pendingSheets []parser.SheetData
+	pendingName   string
+	pendingErr    error
+	loadMsg       string
+	loadLevel     statusLevel
+}
+
+func (s *appState) setLoadResult(sheets []parser.SheetData, name string, err error) {
+	s.mu.Lock()
+	s.pendingSheets = sheets
+	s.pendingName = name
+	s.pendingErr = err
+	s.pendingReady = true
+	w := s.win
+	s.mu.Unlock()
+	if w != nil {
+		w.Invalidate()
+	}
+}
+
+func (s *appState) getLoadBanner() (statusLevel, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.loadLevel, s.loadMsg
+}
+
+// applyPendingLoad applies a completed file load. Called from the frame loop so
+// it is safe to mutate navigation state here.
+func (s *appState) applyPendingLoad() {
+	s.mu.Lock()
+	if !s.pendingReady {
+		s.mu.Unlock()
+		return
+	}
+	sheets, name, err := s.pendingSheets, s.pendingName, s.pendingErr
+	s.pendingReady = false
+	s.pendingSheets = nil
+	if err != nil {
+		s.loadLevel, s.loadMsg = statusError, "Load failed: "+err.Error()
+		s.mu.Unlock()
+		return
+	}
+	s.loadLevel, s.loadMsg = statusSuccess, fmt.Sprintf("Loaded %d sheet(s) from %s", len(sheets), name)
+	s.mu.Unlock()
+
+	s.applySheets(sheets, name)
+}
+
+// applySheets installs parsed sheets and resets navigation/selection state.
+func (s *appState) applySheets(sheets []parser.SheetData, name string) {
+	for i := range sheets {
+		sort.Strings(sheets[i].Locations)
+	}
+	s.sheets = sheets
+	s.currentFile = name
+	s.selectedSheet = -1
+	s.selectedLocIdx = -1
+	s.labels = nil
+	s.labelChecks = nil
+	s.locClicks = nil
+	s.selectAll.Value = false
+	s.sheetClicks = make([]widget.Clickable, len(sheets))
 }
 
 type statusLevel int
@@ -153,20 +226,9 @@ func (s *appState) initConfigFields() {
 }
 
 func Run(excelPath string) {
-	sheets, err := parser.ParseFile(excelPath)
-	if err != nil {
-		panic(err)
-	}
-
-	for i := range sheets {
-		sort.Strings(sheets[i].Locations)
-	}
-
 	state := &appState{
-		sheets:         sheets,
 		selectedSheet:  -1,
 		selectedLocIdx: -1,
-		sheetClicks:    make([]widget.Clickable, len(sheets)),
 		rollClicks:     make([]widget.Clickable, len(MarkerRolls)),
 		printConfig:    defaultPrintConfig(),
 	}
@@ -174,21 +236,34 @@ func Run(excelPath string) {
 	state.locList.List.Axis = layout.Vertical
 	state.labelList.List.Axis = layout.Vertical
 
+	// Try to load the default file, but don't fail if it's missing — the user
+	// can open one from the UI.
+	if sheets, err := parser.ParseFile(excelPath); err == nil {
+		state.applySheets(sheets, filepath.Base(excelPath))
+		state.loadLevel, state.loadMsg = statusSuccess, fmt.Sprintf("Loaded %d sheet(s) from %s", len(sheets), filepath.Base(excelPath))
+	} else {
+		state.loadLevel, state.loadMsg = statusInfo, `No file loaded — click "Open Excel…"`
+	}
+
 	go func() {
 		w := new(app.Window)
 		w.Option(app.Title("PrintWireLabels"), app.Size(unit.Dp(1000), unit.Dp(600)))
 		state.mu.Lock()
 		state.win = w
 		state.mu.Unlock()
+		state.expl = explorer.NewExplorer(w)
 		th := SolarizedDarkTheme()
 
 		var ops op.Ops
 		for {
-			switch e := w.Event().(type) {
+			evt := w.Event()
+			state.expl.ListenEvents(evt)
+			switch e := evt.(type) {
 			case app.DestroyEvent:
 				return
 			case app.FrameEvent:
 				gtx := app.NewContext(&ops, e)
+				state.applyPendingLoad()
 				fillBackground(gtx, th.Palette.Bg)
 				layoutApp(gtx, th, state)
 				e.Frame(gtx.Ops)
@@ -196,6 +271,37 @@ func Run(excelPath string) {
 		}
 	}()
 	app.Main()
+}
+
+// openExcelDialog runs the native file picker on a background goroutine and
+// hands the parsed result back to the frame loop.
+func (s *appState) openExcelDialog() {
+	expl := s.expl
+	if expl == nil {
+		return
+	}
+	go func() {
+		r, err := expl.ChooseFile(".xlsx")
+		if err != nil {
+			if errors.Is(err, explorer.ErrUserDecline) {
+				return
+			}
+			s.setLoadResult(nil, "", err)
+			return
+		}
+		defer r.Close()
+
+		name := "selected file"
+		if f, ok := r.(interface{ Name() string }); ok {
+			name = filepath.Base(f.Name())
+		}
+		sheets, perr := parser.ParseReader(r)
+		if perr != nil {
+			s.setLoadResult(nil, "", perr)
+			return
+		}
+		s.setLoadResult(sheets, name, nil)
+	}()
 }
 
 func fillBackground(gtx layout.Context, col color.NRGBA) {
@@ -236,6 +342,11 @@ func layoutApp(gtx layout.Context, th *material.Theme, state *appState) layout.D
 		for i := range state.labelChecks {
 			state.labelChecks[i].Value = state.selectAll.Value
 		}
+	}
+
+	// Handle open-file button
+	if state.openBtn.Clicked(gtx) {
+		state.openExcelDialog()
 	}
 
 	// Handle roll selection
@@ -309,12 +420,43 @@ func horzSeparator(gtx layout.Context) layout.Dimensions {
 func layoutSheetList(gtx layout.Context, th *material.Theme, state *appState) layout.Dimensions {
 	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
 		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
-			return layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(8), Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: unit.Dp(8), Bottom: unit.Dp(4), Left: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
 				lbl := material.H6(th, "Strips")
 				lbl.Color = ColorHeader()
 				return lbl.Layout(gtx)
 			})
 		}),
+		// Open Excel button
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(2), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				btn := material.Button(th, &state.openBtn, "Open Excel…")
+				btn.Background = ColorSurface()
+				btn.Color = th.Palette.Fg
+				return btn.Layout(gtx)
+			})
+		}),
+		// Current file / load status
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			level, msg := state.getLoadBanner()
+			if msg == "" {
+				return layout.Dimensions{}
+			}
+			col := ColorMuted()
+			switch level {
+			case statusSuccess:
+				col = ColorMuted()
+			case statusError:
+				col = ColorError()
+			case statusInfo:
+				col = ColorAccent()
+			}
+			return layout.Inset{Top: unit.Dp(2), Bottom: unit.Dp(6), Left: unit.Dp(8), Right: unit.Dp(8)}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+				lbl := material.Caption(th, msg)
+				lbl.Color = col
+				return lbl.Layout(gtx)
+			})
+		}),
+		layout.Rigid(horzSeparator),
 		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
 			return material.List(th, &state.sheetList).Layout(gtx, len(state.sheets), func(gtx layout.Context, i int) layout.Dimensions {
 				return layoutListItem(gtx, th, &state.sheetClicks[i], state.sheets[i].Name, i == state.selectedSheet)

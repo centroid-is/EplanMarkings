@@ -2,6 +2,7 @@ package parser
 
 import (
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,14 +33,28 @@ type SheetData struct {
 	Locations        []string // unique location designators
 }
 
-// ParseFile opens an Excel file and parses all terminal strip tabs.
+// ParseFile opens an Excel file by path and parses all terminal strip tabs.
 func ParseFile(path string) ([]SheetData, error) {
 	f, err := excelize.OpenFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening excel file: %w", err)
 	}
 	defer f.Close()
+	return parseSheets(f)
+}
 
+// ParseReader parses an Excel workbook from a reader (e.g. a file chosen via a
+// dialog) and parses all terminal strip tabs.
+func ParseReader(r io.Reader) ([]SheetData, error) {
+	f, err := excelize.OpenReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("reading excel: %w", err)
+	}
+	defer f.Close()
+	return parseSheets(f)
+}
+
+func parseSheets(f *excelize.File) ([]SheetData, error) {
 	var sheets []SheetData
 	for _, name := range f.GetSheetList() {
 		sd, err := parseSheet(f, name)
