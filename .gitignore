@@ -2,4 +2,3 @@
 *.syso
 ~$*
 *.ico
-/winres/icon*.png
